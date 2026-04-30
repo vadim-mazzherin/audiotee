@@ -17,6 +17,9 @@ public class AudioBuffer {
   private var readIndex: Int = 0
   private var availableBytes: Int = 0
   private let maxBufferSize: Int
+  private let chunkDurationMs: Double
+  private var nextReadTiming: AudioPacketTiming?
+  private var nextSequence: UInt64 = 0
 
   public let bytesPerChunk: Int
 
@@ -25,6 +28,7 @@ public class AudioBuffer {
     let bytesPerFrame = Int(format.mBytesPerFrame)
     let samplesPerChunk = Int(format.mSampleRate * chunkDuration)
     self.bytesPerChunk = samplesPerChunk * bytesPerFrame
+    self.chunkDurationMs = (Double(samplesPerChunk) / format.mSampleRate) * 1000.0
 
     // Calculate max buffer size to hold ~10 seconds of audio (safety limit)
     let bytesPerSecond = Int(format.mSampleRate) * bytesPerFrame
@@ -53,7 +57,7 @@ public class AudioBuffer {
   /// This is the fast path used by the IO proc callback: one memcpy from
   /// the Core Audio buffer into our ring buffer, with no intermediate
   /// Data allocation.
-  public func append(from source: UnsafeRawPointer, count: Int) {
+  public func append(from source: UnsafeRawPointer, count: Int, timing: AudioPacketTiming? = nil) {
     guard count >= 0 else {
       AudioTeeLogging.logger.error(
         "Audio buffer append called with negative count",
@@ -69,6 +73,10 @@ public class AudioBuffer {
           "available": String(maxBufferSize - availableBytes),
         ])
       return
+    }
+
+    if availableBytes == 0 {
+      nextReadTiming = timing
     }
 
     if writeIndex + count <= maxBufferSize {
@@ -96,10 +104,23 @@ public class AudioBuffer {
   /// linearized into a pre-allocated scratch buffer — one memcpy, zero
   /// heap allocations.
   public func processChunks(_ handler: (UnsafeRawPointer, Int) -> Void) {
+    processTimedChunks { pointer, count, _ in
+      handler(pointer, count)
+    }
+  }
+
+  /// Calls `handler` once for each complete chunk and includes timing
+  /// metadata for the first sample in the chunk when Core Audio provided it.
+  public func processTimedChunks(_ handler: (UnsafeRawPointer, Int, AudioPacketTiming?) -> Void) {
     while availableBytes >= bytesPerChunk {
+      let chunkTiming = (nextReadTiming ?? AudioPacketTiming(
+        sequence: nextSequence,
+        sourceTimestampMs: nil,
+        hostTimeNs: nil
+      )).withSequence(nextSequence)
       if readIndex + bytesPerChunk <= maxBufferSize {
         // Contiguous: point directly into the ring buffer
-        handler(buffer.advanced(by: readIndex), bytesPerChunk)
+        handler(buffer.advanced(by: readIndex), bytesPerChunk, chunkTiming)
         readIndex = (readIndex + bytesPerChunk) % maxBufferSize
       } else {
         // Wrap-around: linearize into the pre-allocated scratch buffer
@@ -111,11 +132,16 @@ public class AudioBuffer {
         linearizationBuffer.advanced(by: firstChunkSize).copyMemory(
           from: buffer, byteCount: secondChunkSize)
 
-        handler(linearizationBuffer, bytesPerChunk)
+        handler(linearizationBuffer, bytesPerChunk, chunkTiming)
         readIndex = secondChunkSize
       }
 
       availableBytes -= bytesPerChunk
+      nextReadTiming = chunkTiming.advanced(byDurationMs: chunkDurationMs)
+      nextSequence += 1
+      if availableBytes == 0 {
+        nextReadTiming = nil
+      }
     }
   }
 }

@@ -86,7 +86,7 @@ public class AudioRecorder {
         (inDevice, inNow, inInputData, inInputTime, outOutputData, inOutputTime, inClientData)
           -> OSStatus in
         let recorder = Unmanaged<AudioRecorder>.fromOpaque(inClientData!).takeUnretainedValue()
-        return recorder.processAudio(inInputData)
+        return recorder.processAudio(inInputData, inputTime: inInputTime)
       },
       Unmanaged.passUnretained(self).toOpaque(),
       &ioProcID
@@ -105,7 +105,10 @@ public class AudioRecorder {
     }
   }
 
-  private func processAudio(_ inputData: UnsafePointer<AudioBufferList>) -> OSStatus {
+  private func processAudio(
+    _ inputData: UnsafePointer<AudioBufferList>,
+    inputTime: UnsafePointer<AudioTimeStamp>?
+  ) -> OSStatus {
     let bufferList = inputData.pointee
     let firstBuffer = bufferList.mBuffers
 
@@ -118,7 +121,11 @@ public class AudioRecorder {
     // This avoids creating an intermediate Data object (heap alloc + memcpy)
     // on every IO callback (~10ms). The pointer is valid for the duration
     // of this callback, so this is safe.
-    audioBuffer?.append(from: sourcePointer, count: Int(firstBuffer.mDataByteSize))
+    audioBuffer?.append(
+      from: sourcePointer,
+      count: Int(firstBuffer.mDataByteSize),
+      timing: createPacketTiming(from: inputTime)
+    )
 
     processAudioBuffer()
 
@@ -132,18 +139,36 @@ public class AudioRecorder {
   }
 
   private func processAudioBuffer() {
-    audioBuffer?.processChunks { pointer, count in
+    audioBuffer?.processTimedChunks { pointer, count, timing in
       if let converter = self.converter {
         if !converter.transform(from: pointer, count: count, handler: { outPtr, outCount in
-          self.outputHandler.handleAudioData(outPtr, count: outCount)
+          self.outputHandler.handleAudioPacket(outPtr, count: outCount, timing: timing)
         }) {
           // Conversion failed — pass through unconverted audio
-          self.outputHandler.handleAudioData(pointer, count: count)
+          self.outputHandler.handleAudioPacket(pointer, count: count, timing: timing)
         }
       } else {
-        self.outputHandler.handleAudioData(pointer, count: count)
+        self.outputHandler.handleAudioPacket(pointer, count: count, timing: timing)
       }
     }
+  }
+
+  private func createPacketTiming(from inputTime: UnsafePointer<AudioTimeStamp>?) -> AudioPacketTiming? {
+    guard let inputTime = inputTime else {
+      return nil
+    }
+
+    let timestamp = inputTime.pointee
+    guard timestamp.mFlags.contains(.hostTimeValid), timestamp.mHostTime != 0 else {
+      return nil
+    }
+
+    let hostTimeNs = AudioConvertHostTimeToNanos(timestamp.mHostTime)
+    return AudioPacketTiming(
+      sequence: 0,
+      sourceTimestampMs: Double(hostTimeNs) / 1_000_000.0,
+      hostTimeNs: hostTimeNs
+    )
   }
 
   private func cleanupIOProc() {
